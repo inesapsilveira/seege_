@@ -11,6 +11,34 @@ def _sim(a, b, eps=1e-12):
     """Normalised absolute-difference similarity in [0,1]."""
     return 1.0 - np.abs(a - b) / (np.abs(a) + np.abs(b) + eps)
 
+def as_NT(x, *, name="data"):
+    """Return data as (N,T). Accepts (T,), (N,T), (N,1,T), (C,T) [single sample multi-channel not allowed]."""
+    x = np.asarray(x)
+    if x.ndim == 1:
+        return x[None, :]
+    if x.ndim == 2:
+        # interpret as (N,T)
+        return x
+    if x.ndim == 3:
+        # (N,C,T) -> only allowed if C==1
+        if x.shape[1] != 1:
+            raise ValueError(f"{name}: cannot convert multichannel (N,C,T) with C={x.shape[1]} to (N,T) without a reduction.")
+        return x[:, 0, :]
+    raise ValueError(f"{name}: unsupported shape {x.shape} for as_NT")
+
+def as_NCT(x, *, name="data"):
+    """Return data as (N,C,T). Accepts (C,T), (N,C,T), (N,T) [assumes C=1]."""
+    x = np.asarray(x)
+    if x.ndim == 2:
+        # Could be (N,T) or (C,T). We disambiguate by assuming it's (N,T) and make it (N,1,T)
+        # If you want to allow (C,T) single sample, pass explicitly with a flag (see below).
+        return x[:, None, :]
+    if x.ndim == 3:
+        return x
+    if x.ndim == 1:
+        return x[None, None, :]
+    raise ValueError(f"{name}: unsupported shape {x.shape} for as_NCT")
+
 def _entropy_weights(values, eps=1e-12):
     """
     Compute entropy-based adaptive weights.
@@ -56,6 +84,51 @@ def _weighted_geometric_mean(x, w=None, eps=1e-12):
     w = np.asarray(w, dtype=float)
     w = w / (np.sum(w) + eps)
     return float(np.prod(x ** w))
+
+def _entropy_weights_matrix(values, eps=1e-12):
+    """
+    Compute entropy-based weights across several evaluated conditions
+    (entropy weight method).
+    Higher variability of a component across conditions → higher weight.
+
+    Unlike `_entropy_weights`, which receives a single vector of scores, this
+    function receives one row of scores per condition, so the weights reflect
+    how much each component varies across conditions (not its value).
+
+    Parameters
+    ----------
+    values : array-like, shape (n_conditions, n_components)
+        Component scores for each condition evaluated against the same real
+        data (e.g. RR baseline, GAN synthetic, phase-randomised surrogate,
+        noise, mode collapse, memorised real).
+
+    Returns
+    -------
+    np.ndarray
+        Normalized weights (one per component) summing to 1.
+    """
+    x = np.clip(np.asarray(values, dtype=float), 0.0, None)
+    n_conditions = x.shape[0]
+    if n_conditions < 2:
+        raise ValueError("Entropy weights need at least two conditions (rows).")
+
+    # Normalize each component (column) to probabilities across conditions
+    col_sum = x.sum(axis=0)
+    p = np.divide(x, col_sum, out=np.full_like(x, 1.0 / n_conditions), where=col_sum > eps)
+
+    # Normalized Shannon entropy per component
+    with np.errstate(divide="ignore", invalid="ignore"):
+        plogp = np.where(p > 0, p * np.log(p), 0.0)
+    H = -plogp.sum(axis=0) / np.log(n_conditions)
+
+    # Information utility (1 - normalized entropy)
+    utility = np.clip(1.0 - H, 0.0, None)
+
+    # If no component varies → fallback to uniform weights
+    if utility.sum() <= eps:
+        return np.ones(x.shape[1]) / x.shape[1]
+
+    return utility / utility.sum()
 
 def compute_time_fidelity_score(real_data, synthetic_data, weights=None):
     """
@@ -154,10 +227,10 @@ def compute_frequency_fidelity_score(real_data, synthetic_data, fs, weights=None
     weights : dict, optional
         Weights for the four sub-scores.  Must contain the keys:
             {'relative', 'dom_freq', 'psd_coherence', 'wasserstein'}
-        Defaults to: {'relative': 0.40,
-                      'dom_freq': 0.20,
-                      'psd_coherence': 0.20,
-                      'wasserstein': 0.20}
+        Defaults to: {'relative': 0.30,
+                      'dom_freq': 0.30,
+                      'psd_coherence': 0.30,
+                      'wasserstein': 0.10}
 
     Example usage:
     --------------
@@ -249,10 +322,10 @@ def compute_frequency_fidelity_score(real_data, synthetic_data, fs, weights=None
     # Weights
     if weights is None:
         weights = {
-            'relative': 0.40,
-            'dom_freq': 0.20,
-            'psd_coherence': 0.20,
-            'wasserstein': 0.20
+            'relative': 0.30,
+            'dom_freq': 0.30,
+            'psd_coherence': 0.30,
+            'wasserstein': 0.10
         }
 
     # Fallback – add any missing keys with zero weight
@@ -407,10 +480,10 @@ def compute_time_frequency_fidelity_score(real_data, synthetic_data, fs, *, weig
     """
 
     if weights is None:
-        weights = {'color_ssim': 0.4, 'rmse': 0.3, 'cosine_similarity': 0.3}
-    w_cssim = float(weights.get('color_ssim', 0.4))
-    w_rmse  = float(weights.get('rmse', 0.3))
-    w_cos   = float(weights.get('cosine_similarity', 0.3))
+        weights = {'color_ssim': 0.6, 'rmse': 0.2, 'cosine_similarity': 0.2}
+    w_cssim = float(weights.get('color_ssim', 0.6))
+    w_rmse  = float(weights.get('rmse', 0.2))
+    w_cos   = float(weights.get('cosine_similarity', 0.2))
 
     # Normalize inputs: auto-wrap 1-D → (1, T)
     R = np.asarray(real_data, dtype=float)
@@ -661,7 +734,8 @@ def compute_spatial_fidelity_score(real_data, synthetic_data):
 
 use_adaptive_weights = False
 
-def compute_fidelity_score(real_data, synthetic_data, fs):
+def compute_fidelity_score(real_data, synthetic_data, fs, use_adaptive_weights=True,
+                           spatial_requires_multichannel=True):
     """
     Computes global fidelity score using entropy-adaptive weighting
     and weighted geometric aggregation.
@@ -688,32 +762,46 @@ def compute_fidelity_score(real_data, synthetic_data, fs):
 
     evaluation_score.compute_fidelity_score(real_data, synthetic_data, fs=2048)
     """
+    # Univariate view for most metrics
+    real_u = as_NT(real_data, name="real_data")
+    syn_u = as_NT(synthetic_data, name="synthetic_data")
+
     time_sim = compute_time_fidelity_score(real_data, synthetic_data)
     freq_sim = compute_frequency_fidelity_score(real_data, synthetic_data, fs)
     scalogram_sim = compute_time_frequency_fidelity_score(real_data, synthetic_data, fs)
     fractal_sim = compute_complexity_fidelity_score(real_data, synthetic_data)
-    spatial_sim = compute_spatial_fidelity_score(real_data,synthetic_data)
 
-    components = np.array([
-        time_sim,
-        freq_sim,
-        scalogram_sim,
-        fractal_sim,
-        spatial_sim
-    ], dtype=float)
+    # Multichannel view for spatial
+    real_m = as_NCT(real_data, name="real_data")
+    syn_m = as_NCT(synthetic_data, name="synthetic_data")
 
-    # Compute weights
-    if use_adaptive_weights:
-        weights = _entropy_weights(components)
+    # Decide what to do if C<2
+    if real_m.shape[1] < 2 or syn_m.shape[1] < 2:
+        if spatial_requires_multichannel:
+            spatial_sim = np.nan
+        else:
+            # Treat as "not applicable" and don't penalize
+            spatial_sim = 1.0
     else:
-        weights = np.ones(4) / 4.0
+        spatial_sim = compute_spatial_fidelity_score(real_m, syn_m)
 
-    # Weighted geometric mean (penalizes collapse)
+    components = np.array([time_sim, freq_sim, scalogram_sim, fractal_sim, spatial_sim], dtype=float)
+
+    # Handle N/A domains (NaN) by excluding them from aggregation
+    valid = np.isfinite(components)
+    comps_v = components[valid]
+
+    if comps_v.size == 0:
+        return np.nan
+
+    # weights
+    if use_adaptive_weights:
+        weights = _entropy_weights(comps_v)
+    else:
+        weights = np.ones(comps_v.size) / comps_v.size
+
     eps = 1e-12
-    fidelity_score = np.prod(
-        np.clip(components, eps, 1.0) ** weights
-    )
-
+    fidelity_score = np.prod(np.clip(comps_v, eps, 1.0) ** weights)
     fidelity_score = float(np.clip(fidelity_score, 0.0, 1.0))
 
     print(f"\nGlobal Fidelity Score: {fidelity_score:.3f}")
@@ -722,91 +810,131 @@ def compute_fidelity_score(real_data, synthetic_data, fs):
     print(f"  Frequency   : {freq_sim:.3f}")
     print(f"  Time-Freq   : {scalogram_sim:.3f}")
     print(f"  Complexity  : {fractal_sim:.3f}")
-    print(f"  Spatial     : {spatial_sim:.3f}")
-    print("Adaptive Weights:")
+    print(f"  Spatial     : {spatial_sim if np.isfinite(spatial_sim) else float('nan'):.3f}")
+    print("Weights:")
     print(f"  {weights}")
 
     return fidelity_score
 
-
-
-def compute_diversity_score(real_data, synthetic_data, weights=None, n_components=2):
+def compute_diversity_score(real_data, synthetic_data, weights=None, n_components=2,
+                            use_adaptive_weights=False, floor=0.01, return_components=False):
     """
-    Composite diversity score in [0,1].
+    Composite diversity score combining coverage, geometric and intrinsic
+    diversity components.
 
-    Aggregation:
-      - If `weights` is provided: weighted geometric mean using those weights.
-      - Else: entropy-adaptive weights + weighted geometric mean.
+    Final aggregation: weighted geometric mean over available (finite) subscores.
+    This penalizes collapse in any single diversity component.
 
-    This avoids linear compensation across heterogeneous diversity components.
+    Subscores (mapped to [0,1], higher = closer match):
+        - coverage, outliers
+        - pca_labelmix, umap_labelmix, pca_overlap, umap_overlap,
+          pca_covshape, umap_covshape
+        - uniqueness, global_div, local_div_p10, local_div_p50
+          (ratios r normalised as exp(-|ln r|))
+
+    Parameters
+    ----------
+    real_data : np.ndarray
+        Real signals of shape [n_signals, n_samples].
+    synthetic_data : np.ndarray
+        Synthetic signals of shape [n_signals, n_samples].
+    weights : dict, optional
+        Weights for the subscores (keys as listed above), e.g. obtained with
+        `_entropy_weights_matrix` across validation conditions.
+        Default: equal weights across all subscores (1/12 each).
+    n_components : int, optional
+        Number of PCA/UMAP components (default 2).
+    use_adaptive_weights : bool, optional
+        If True, use `_entropy_weights` on this single score vector (published
+        behaviour; reduces to w_k = D_k / sum(D), giving the worst component the
+        least weight). Default False.
+    floor : float, optional
+        Subscores are floored at this value before aggregation, so a single
+        subscore at 0 does not force the score to 0 (default 0.01).
+    return_components : bool, optional
+        If True, also return the dict of subscores.
+
+    Example usage:
+    --------------
+
+    real_data = np.random.randn(200, 2048)  # 200 real signals, each 2048 samples
+    synthetic_data = np.random.randn(200, 2048) # 200 synthetic signals, each 2048 samples
+
+    evaluation_score.compute_diversity_score(real_data, synthetic_data)
+
+    Returns
+    -------
+    float (or (float, dict) if return_components=True)
+        Composite diversity score in [0, 1].
     """
 
-    def normalize_ratio(ratio):
-        if not np.isfinite(ratio) or ratio <= 0:
+    # Default: equal weights across ALL subscores (12 components)
+    if weights is None:
+        weights = {
+            'coverage': 1/12, 'outliers': 1/12,
+            'pca_labelmix': 1/12, 'umap_labelmix': 1/12,
+            'pca_overlap': 1/12, 'umap_overlap': 1/12,
+            'pca_covshape': 1/12, 'umap_covshape': 1/12,
+            'uniqueness': 1/12, 'global_div': 1/12,
+            'local_div_p10': 1/12, 'local_div_p50': 1/12
+        }
+
+    # Helpers
+    def _normalize_ratio(ratio):
+        if ratio is None or not np.isfinite(ratio) or ratio <= 0:
             return np.nan
         return float(np.exp(-abs(np.log(ratio))))
 
+    # Diversity metrics
     div = Diversity(n_components=n_components)
     m_cov = div.compute_coverage_diversity(real_data, synthetic_data)
     m_geom = div.compute_geometric_diversity(real_data, synthetic_data)
     m_intr = div.compute_intrinsic_diversity(real_data, synthetic_data)
 
-    # 1) Coverage / Outliers
-    C_cov = float(m_cov['Coverage'])
-    O_out = float(m_cov['Outliers'])
+    subscores = {
+        'coverage':      float(m_cov['Coverage']),
+        'outliers':      float(m_cov['Outliers']),
+        'pca_labelmix':  float(m_geom['PCA_LabelMixingScore']),
+        'umap_labelmix': float(m_geom['UMAP_LabelMixingScore']),
+        'pca_overlap':   float(m_geom['PCA_OverlapMahalanobis']),
+        'umap_overlap':  float(m_geom['UMAP_OverlapMahalanobis']),
+        'pca_covshape':  float(m_geom['PCA_CovShape']),
+        'umap_covshape': float(m_geom['UMAP_CovShape']),
+        'uniqueness':    _normalize_ratio(m_intr['Uniqueness_NN']),
+        'global_div':    _normalize_ratio(m_intr['Global_Diversity']),
+        'local_div_p10': _normalize_ratio(m_intr['Local_Diversity_P10']),
+        'local_div_p50': _normalize_ratio(m_intr['Local_Diversity_P50'])
+    }
 
-    # 2) Geometric diversity
-    LM_PCA = float(m_geom['PCA_LabelMixingScore'])
-    LM_UM  = float(m_geom['UMAP_LabelMixingScore'])
-    D_PCA  = float(m_geom['PCA_OverlapMahalanobis'])
-    D_UM   = float(m_geom['UMAP_OverlapMahalanobis'])
-    CS_PCA = float(m_geom['PCA_CovShape'])
-    CS_UM  = float(m_geom['UMAP_CovShape'])
+    # Keep only finite subscores
+    keys = [k for k, v in subscores.items() if np.isfinite(v)]
+    if not keys:
+        raise RuntimeError("Diversity score could not be computed (all subscores NaN).")
 
-    # 3) Intrinsic ratios (normalized)
-    U_NN       = normalize_ratio(m_intr['Uniqueness_NN'])
-    G_glob     = normalize_ratio(m_intr['Global_Diversity'])
-    L_loc_P10  = normalize_ratio(m_intr['Local_Diversity_P10'])
-    L_loc_P50  = normalize_ratio(m_intr['Local_Diversity_P50'])
+    vals = np.array([subscores[k] for k in keys], dtype=float)
 
-    comps = np.array([
-        C_cov, O_out,
-        LM_PCA, LM_UM,
-        D_PCA, D_UM,
-        CS_PCA, CS_UM,
-        U_NN, G_glob,
-        L_loc_P10, L_loc_P50
-    ], dtype=float)
+    # Collect weights for valid keys, renormalize
+    if use_adaptive_weights:
+        w = _entropy_weights(vals)
+    else:
+        w = np.array([float(weights.get(k, 0.0)) for k in keys], dtype=float)
 
-    names = [
-        "coverage", "outliers",
-        "pca_labelmix", "umap_labelmix",
-        "pca_overlap", "umap_overlap",
-        "pca_covshape", "umap_covshape",
-        "uniqueness", "global_div",
-        "local_div_p10", "local_div_p50"
-    ]
+    if float(np.sum(w)) <= 0:
+        w = np.ones_like(vals) / vals.size
+    else:
+        w = w / float(np.sum(w))
 
-    # Drop NaNs
-    valid = np.isfinite(comps)
-    comps_v = comps[valid]
-    names_v = [n for n, ok in zip(names, valid) if ok]
-
-    if comps_v.size == 0:
-        raise RuntimeError("Diversity score could not be computed (all submetrics NaN).")
-
-    # Entropy weights
-    w = _entropy_weights(comps_v)
-
-    diversity_score = _weighted_geometric_mean(comps_v, w)
+    score = _weighted_geometric_mean(np.maximum(vals, floor), w)
 
     # Printing
-    print(f"Final Diversity Score: {diversity_score:0.3f}\n")
-    for n, v, wi in zip(names_v, comps_v, w):
-        print(f"{n:16s}: {v:0.3f}  |  weight = {wi:0.3f}")
+    print(f"Diversity Score: {score:0.3f}\n")
+    for k, v, wi in zip(keys, vals, w):
+        print(f"{k.upper():14s}: {v:0.3f}  |  weight = {wi:0.3f}")
 
-    return float(np.clip(diversity_score, 0.0, 1.0))
-
+    score = float(np.clip(score, 0.0, 1.0))
+    if return_components:
+        return score, subscores
+    return score
 
 
 def compute_privacy_score(
